@@ -1,0 +1,18 @@
+# Logs generated at runtime
+*.txt
+*.log
+
+# Internal Claude Code session files
+.claude/
+
+# Backup folder
+backups/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Windows
+Thumbs.db
+Desktop.ini
