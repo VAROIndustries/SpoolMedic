@@ -110,5 +110,5 @@ Open them from the tray icon → **View Log…**
 
 ## More from VARØ Industries
 
-Free web apps, tools, and open-source projects → [varo.industries/apps](https://varo.industries/apps)
+Free web apps, tools, and open-source projects → [varo.industries/apps](https://varo.industries/apps#github)
 
