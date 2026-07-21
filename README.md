@@ -1,5 +1,8 @@
 # SpoolMedic
 
+**🌐 Tool page: [varo.industries/tools/spoolmedic](https://varo.industries/tools/spoolmedic)** — features, screenshots, install, and FAQ.
+
+
 **Fix stuck print queues without rebooting.**
 
 SpoolMedic is a lightweight Windows system tray utility that resets the Windows Print Spooler service and clears stuck print jobs on demand — everything your printer needs that normally requires a full reboot, in a single click.
