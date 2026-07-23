@@ -11,12 +11,13 @@ import threading
 import ctypes
 import subprocess
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Callable
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
@@ -37,6 +38,9 @@ except ImportError:
 APP_NAME    = "SpoolMedic"
 APP_VERSION = "1.0.0"
 TASK_NAME   = "SpoolMedicStartup"
+
+APPS_URL   = "https://varo.industries/apps#github"
+GITHUB_URL = "https://github.com/VAROIndustries/SpoolMedic"
 
 WINDIR        = Path(os.environ.get("WINDIR", r"C:\Windows"))
 SPOOL_FOLDER  = WINDIR / "System32" / "spool" / "PRINTERS"
@@ -75,9 +79,16 @@ def is_admin() -> bool:
 
 
 def _python_exe() -> str:
-    """Return the Python interpreter path (or the frozen exe path)."""
+    """Return the Python interpreter path (or the frozen exe path).
+
+    Prefers SpoolMedic.exe (a copy of pythonw.exe in the script dir)
+    so Windows sees a unique exe identity in the notification area.
+    """
     if getattr(sys, "frozen", False):
         return sys.executable
+    local_exe = Path(_script_path()).parent / "SpoolMedic.exe"
+    if local_exe.exists():
+        return str(local_exe)
     return sys.executable
 
 
@@ -404,32 +415,75 @@ def _app_command() -> str:
 
 def task_exists() -> bool:
     r = subprocess.run(
-        ["schtasks", "/Query", "/TN", TASK_NAME],
-        capture_output=True, text=True,
+        ["powershell", "-NoProfile", "-Command",
+         f"if (Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue) {{ 'YES' }} else {{ 'NO' }}"],
+        capture_output=True, text=True, timeout=15,
     )
-    return r.returncode == 0
+    return "YES" in r.stdout
 
 
 def create_startup_task(elevated: bool = True) -> bool:
-    """Create (or replace) a Task Scheduler logon task."""
-    cmd_parts = ["schtasks", "/Create", "/F",
-                 "/TN", TASK_NAME,
-                 "/TR", _app_command(),
-                 "/SC", "ONLOGON"]
-    if elevated:
-        cmd_parts += ["/RL", "HIGHEST"]
-    r = subprocess.run(cmd_parts, capture_output=True, text=True)
-    if r.returncode == 0:
-        log("Startup task created.", "SUCCESS")
-        return True
-    log(f"Failed to create startup task: {r.stderr.strip()}", "ERROR")
-    return False
+    """Create (or replace) a Task Scheduler logon task via PowerShell.
+
+    Uses Register-ScheduledTask for full control over settings:
+    - Runs whether on battery or plugged in
+    - Won't stop when switching to battery
+    - 30-second startup delay to let the desktop settle
+    - Start-in directory set to the script's folder
+    """
+    import tempfile
+
+    run_level = "Highest" if elevated else "Limited"
+    exe = _python_exe()
+    script = _script_path()
+    script_dir = str(Path(script).parent)
+
+    ps_code = (
+        f"$action = New-ScheduledTaskAction "
+        f"-Execute '{exe}' "
+        f"""-Argument '""{script}""' """
+        f"-WorkingDirectory '{script_dir}'\n"
+        f"$trigger = New-ScheduledTaskTrigger -AtLogOn\n"
+        f"$trigger.Delay = 'PT30S'\n"
+        f"$settings = New-ScheduledTaskSettingsSet "
+        f"-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+        f"-StartWhenAvailable "
+        f"-ExecutionTimeLimit (New-TimeSpan -Hours 0)\n"
+        f"$principal = New-ScheduledTaskPrincipal "
+        f"-UserId $env:USERNAME "
+        f"-LogonType Interactive -RunLevel {run_level}\n"
+        f"Register-ScheduledTask -Force "
+        f"-TaskName '{TASK_NAME}' "
+        f"-Action $action -Trigger $trigger "
+        f"-Settings $settings -Principal $principal\n"
+    )
+
+    # Write to a temp .ps1 to avoid shell-escaping issues
+    tmp = Path(tempfile.gettempdir()) / f"spoolmedic_task_{os.getpid()}.ps1"
+    try:
+        tmp.write_text(ps_code, encoding="utf-8")
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(tmp)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            log("Startup task created.", "SUCCESS")
+            return True
+        log(f"Failed to create startup task: {r.stderr.strip()}", "ERROR")
+        return False
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def remove_startup_task() -> bool:
     r = subprocess.run(
-        ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
-        capture_output=True, text=True,
+        ["powershell", "-NoProfile", "-Command",
+         f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue"],
+        capture_output=True, text=True, timeout=15,
     )
     if r.returncode == 0:
         log("Startup task removed.", "SUCCESS")
@@ -731,6 +785,62 @@ class LogWindow:
 
 
 # ===========================================================================
+# About Window
+# ===========================================================================
+
+class AboutWindow:
+    def __init__(self, root: tk.Tk, icon_image: Optional[Image.Image] = None):
+        self.win = tk.Toplevel(root)
+        self.win.title(f"About {APP_NAME}")
+        self.win.resizable(False, False)
+        self.win.attributes("-topmost", True)
+        self.win.grab_set()
+        self.win.lift()
+        self.win.focus_force()
+        self._logo = None  # keep a reference so the image isn't garbage-collected
+        self._build(icon_image)
+        self._center()
+
+    def _center(self):
+        self.win.update_idletasks()
+        w = self.win.winfo_width()
+        h = self.win.winfo_height()
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        self.win.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+    def _build(self, icon_image: Optional[Image.Image]):
+        pad = tk.Frame(self.win, padx=28, pady=20)
+        pad.pack()
+
+        if icon_image is not None:
+            try:
+                self._logo = ImageTk.PhotoImage(icon_image.resize((64, 64)))
+                tk.Label(pad, image=self._logo).pack(pady=(0, 8))
+            except Exception:
+                self._logo = None
+
+        tk.Label(pad, text=APP_NAME, font=("Segoe UI", 16, "bold"),
+                 fg=C_DARK_BLUE).pack()
+        tk.Label(pad, text=f"Version {APP_VERSION}", fg="#555").pack(pady=(2, 0))
+        tk.Label(pad, text="Fixes stuck print queues without a reboot.",
+                 fg="#333").pack(pady=(6, 12))
+
+        def _link(text: str, url: str):
+            lbl = tk.Label(pad, text=text, fg="#1a6ec8", cursor="hand2",
+                           font=("Segoe UI", 9, "underline"))
+            lbl.pack()
+            lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+            return lbl
+
+        _link("varo.industries/apps", APPS_URL)
+        _link("github.com/VAROIndustries/SpoolMedic", GITHUB_URL)
+
+        tk.Label(pad, text="© 2026 VARØ Industries", fg="#888").pack(pady=(12, 10))
+        tk.Button(pad, text="Close", width=10, command=self.win.destroy).pack()
+
+
+# ===========================================================================
 # Main Application
 # ===========================================================================
 
@@ -808,6 +918,10 @@ class SpoolMedicApp:
         if self.root:
             self.root.after(0, lambda: LogWindow(self.root))
 
+    def open_about(self, _icon=None, _item=None):
+        if self.root:
+            self.root.after(0, lambda: AboutWindow(self.root, self._normal_icon))
+
     def _on_config_saved(self, new_cfg: dict):
         self.config = new_cfg
 
@@ -842,6 +956,7 @@ class SpoolMedicApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Settings…", self.open_settings),
             pystray.MenuItem("View Log…", self.open_log),
+            pystray.MenuItem("About…",    self.open_about),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", self.exit_app),
         )
